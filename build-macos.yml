@@ -1,0 +1,115 @@
+name: Build Caxton for macOS (Apple Silicon)
+
+# Builds the Caxton Minecraft mod (https://gitlab.com/Kyarei/caxton) on an
+# Apple Silicon GitHub runner, so the jar contains the
+# aarch64-apple-darwin native library that the official releases lack.
+#
+# Run it from the Actions tab -> "Build Caxton for macOS" -> "Run workflow".
+
+on:
+  workflow_dispatch:
+    inputs:
+      caxton_branch:
+        description: >-
+          Caxton branch to build. Branches are named after Minecraft versions
+          (e.g. 1.20.1, 1.21.1, 1.21.11, 26.1.2). "avenir" is the latest dev branch.
+        required: true
+        default: "1.21.1" # Caxton 0.6.4, Fabric/NeoForge/Forge for MC 1.21.1
+      also_intel:
+        description: Also include an Intel (x86_64) Mac library in the jar
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15 # Apple Silicon (arm64)
+    timeout-minutes: 60
+    env:
+      CAXTON_BRANCH: ${{ inputs.caxton_branch }}
+      ALSO_INTEL: ${{ inputs.also_intel }}
+    steps:
+      - name: Clone Caxton from GitLab
+        run: |
+          git clone --depth 1 --branch "$CAXTON_BRANCH" \
+            --recurse-submodules --shallow-submodules \
+            https://gitlab.com/Kyarei/caxton.git caxton
+          git -C caxton log -1 --format='Building commit %H (%ad): %s'
+
+      - name: Work out which Java version this branch needs
+        id: java
+        working-directory: caxton
+        run: |
+          jv="$(grep -E '^java_version=' gradle.properties 2>/dev/null | cut -d= -f2 | tr -d '[:space:]' || true)"
+          if [ -z "$jv" ]; then
+            jv="$(grep -rhoE 'options\.release *= *[0-9]+' --include='*.gradle' . | grep -oE '[0-9]+$' | sort -n | tail -1 || true)"
+          fi
+          jv="${jv:-21}"
+          echo "Using Java $jv"
+          echo "version=$jv" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ steps.java.outputs.version }}
+
+      - name: Set up Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          if [ "$ALSO_INTEL" = "true" ]; then rustup target add x86_64-apple-darwin; fi
+          rustc --version
+          rustc --print host-tuple
+
+      - name: Register the Intel Mac target (optional)
+        if: inputs.also_intel
+        working-directory: caxton
+        run: |
+          # Caxton only knows Windows/Linux cross targets; add x86_64 macOS next to them.
+          python3 - <<'EOF'
+          import pathlib, re
+          p = pathlib.Path("common/caxton-impl/build.gradle")
+          s = p.read_text()
+          anchor = "registerCrossBuildTask('compileLinuxLibrary', 'x86_64-unknown-linux-gnu', 'libcaxton_impl.so'),"
+          if anchor not in s:
+              raise SystemExit("Could not find the cross-build target list in " + str(p))
+          s = s.replace(anchor, anchor + "\n        registerCrossBuildTask('compileMacIntelLibrary', 'x86_64-apple-darwin', 'libcaxton_impl.dylib'),")
+          p.write_text(s)
+          EOF
+          echo "GRADLE_EXTRA=-Dxyz.flirora.caxton.additionalTargets=x86_64-apple-darwin" >> "$GITHUB_ENV"
+
+      - name: Build
+        working-directory: caxton
+        run: |
+          chmod +x gradlew
+          ./gradlew build --no-daemon --stacktrace $GRADLE_EXTRA
+
+      - name: Check the jars contain the Mac library
+        working-directory: caxton
+        run: |
+          mkdir -p ../out
+          found=0
+          for jar in */build/libs/*.jar; do
+            case "$jar" in common/*|*-sources.jar|*-dev*.jar|*-javadoc.jar) continue ;; esac
+            echo "== $jar"
+            unzip -l "$jar" | grep 'natives/' || true
+            if unzip -l "$jar" | grep -q 'natives/aarch64-apple-darwin-libcaxton_impl.dylib'; then
+              cp "$jar" ../out/
+              found=1
+            fi
+          done
+          if [ "$found" != 1 ]; then
+            echo "::error::No mod jar contains natives/aarch64-apple-darwin-libcaxton_impl.dylib"
+            exit 1
+          fi
+          ls -la ../out
+
+      - name: Upload jars
+        uses: actions/upload-artifact@v4
+        with:
+          name: caxton-${{ inputs.caxton_branch }}-macos
+          path: out/*.jar
+          if-no-files-found: error
